@@ -267,6 +267,7 @@ class api_handler (threading.Thread):
         #
         self.request_type = None
         self.request_params = {}
+        self.request_keepalive = False
 
         headers = headers.split('\n')
         request = headers[0].split()
@@ -293,7 +294,6 @@ class api_handler (threading.Thread):
         # Everything kosher, so come back with request type
         self.request_type = reqtype
         # now check for keep-alive header, we allow it
-        self.request_keepalive = False
         for h in headers:
             kv = h.lower().split(':')
             if len(kv) != 2:

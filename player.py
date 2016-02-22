@@ -34,7 +34,7 @@ while True:
                 res = 'err'
         if cmd[0:5] == 'track':
             path = '/mnt/'+cmd[6]+'/'+cmd[7]+'/'+cmd[6:]
-            if os.path.exists(path)
+            if os.path.exists(path):
                 track = cmd[6:]
                 m=v.media_new(path)
                 p.set_media(m)

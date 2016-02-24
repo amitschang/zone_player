@@ -12,9 +12,16 @@ import time
 
 class sink:
     '''class representing a network attached player using this protocol'''
-    def __init__ (self, address, port=9988):
+    def __init__ (self, address, port=9988, names=None):
         self.address = address
         self.port = port
+        self.id = address+':'+str(port)
+        self.aliases = []
+        if names:
+            if type(names) == str:
+                self.aliases = [names]
+            elif type(names) == list:
+                self.aliases = names
         self.status = {
             'connected':False,
             'state':'initializing',
@@ -41,6 +48,8 @@ class sink:
     def report (self):
         return {
             'address': '%s:%d' %(self.address,self.port),
+            'id': self.id,
+            'aliases': self.aliases,
         }
 
     def send_command (self, command, args=''):
@@ -196,8 +205,8 @@ class main_manager:
         self.zones = []
         self.media = {}
 
-    def create_sink (self, address, port):
-        s = sink(address, port)
+    def create_sink (self, address, port, names=None):
+        s = sink(address, port, names=names)
         m = sink_manager(s,aliases=['zone%d' %(len(self.zones)+1)])
         m.start()
         self.zones.append(m)

@@ -31,13 +31,19 @@ class sink:
             'contact':0,
             'age':0,
         }
+        self.last_conn_attempt = 0
 
     def connect (self):
+        if self.status['connected']:
+            return
+        if time.time() - self.last_conn_attempt < 1:
+            return
+        self.last_conn_attempt = time.time()
         self.sock = socket.socket()
         try:
-            self.sock.settimeout(1)
+            print 'attempting reconnect on sock %s,%d' %(self.address,self.port)
+            self.sock.settimeout(0)
             self.sock.connect((self.address,self.port))
-            self.status['connected'] = True
             return 1
         except:
             return 0
@@ -67,6 +73,7 @@ class sink:
         try:
             self.sock.settimeout(0.2)
             self.sock.send('\n'+full_command.strip())
+            self.status['connected'] = True
             response = self.sock.recv(2048)
             # print 'response: %s' %(response.strip())
             response = response.split('\n')[-2].split(' ')
@@ -85,7 +92,8 @@ class sink:
                 return 0
             else:
                 self.status['connected'] = False
-                print 'socket error, attempting to reconnect'
+                print 'socket error %s, attempting to reconnect'
+                print e
                 self.connect()
 
     def play (self):

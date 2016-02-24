@@ -140,10 +140,19 @@ class sink_manager (threading.Thread):
         self.aliases = aliases
         self.playlist = []
         self.lastadd = 0
+        self.targetvol = 50
 
     def add_sink (self, sink):
         sink.connect()
         self.sinks.append(sink)
+
+    def remove_sink (self, sink_id):
+        for s in self.sinks:
+            if s.id == sink_id or sink_id in s.aliases:
+                s.stop()
+                self.sinks.remove(s)
+                return s
+        return 0
 
     def report (self):
         return {
@@ -155,7 +164,7 @@ class sink_manager (threading.Thread):
     def playnext (self):
         if len(self.playlist) > 0:
             n = self.playlist.pop(0)
-            self.sinks[0].track(n)
+            [ i.track(n) for i in self.sinks ]
             self.lastadd = time.time()
             print 'added track at time %d'%self.lastadd
 
@@ -167,6 +176,9 @@ class sink_manager (threading.Thread):
                 cmd = None
                 pass
             if cmd:
+                if len(self.sinks) == 0:
+                    res={'_err':'zone has no sinks'}
+                    cmd['_cmd'] = ''
                 if cmd['_cmd'] == 'enqueue':
                     self.playlist.append(cmd['file'])
                     res={'file':cmd['file']}
@@ -181,10 +193,11 @@ class sink_manager (threading.Thread):
                     self.playlist = []
                     res={'status':'okay'}
                 if cmd['_cmd'] == 'vol':
-                    self.sinks[0].vol(cmd['vol'])
+                    self.targetvol = cmd['vol']
+                    [ i.vol(cmd['vol']) for i in self.sinks ]
                     res={'status':'okay'}
                 if cmd['_cmd'] == 'pause':
-                    self.sinks[0].pause()
+                    [ i.pause() for i in self.sinks ]
                     res={'status':'okay'}
                 if cmd['_cmd'] == 'play':
                     self.sinks[0].play()
@@ -193,18 +206,25 @@ class sink_manager (threading.Thread):
                     self.sinks[0].stop()
                     res={'status':'okay'}
                 if cmd['_cmd'] == 'status':
-                    res = self.sinks[0].getstate()
+                    res = {}
+                    res['vol'] = self.targetvol
+                    res['sinks'] = [ i.getstate() for i in self.sinks ]
+                    res['time'] = int(sum([ int(i['time']) for i in res['sinks'] ])/(1.0*len(res['sinks'])))
+                    for i in res['sinks']:
+                        i['skew'] = int(i['time'])-int(res['time'])
+                    res['state'] = res['sinks'][0]['state']
                     res['playlist'] = self.playlist
                 if '_queue' in cmd and cmd['_queue']:
                     cmd['_queue'].put(res)
 
-            if time.time() - self.sinks[0].status['contact'] > 0.3:
-                self.sinks[0].getstate()
+            if len(self.sinks) > 0:
+                if max([ time.time() - i.status['contact'] for i in self.sinks ]) > 0.3:
+                    for i in self.sinks:
+                        i.getstate()
         
-            if self.sinks[0].status['state'] == 'stopped':
-                if time.time() - self.lastadd > 1:
-                    print 'status stopped and %d s since last add, playing next' %(time.time() - self.lastadd)
-                    self.playnext()
+                if 'stopped' in [ i.status['state'] for i in self.sinks ]:
+                    if time.time() - self.lastadd > 1:
+                        self.playnext()
 
 class main_manager:
     def __init__ (self):
@@ -218,6 +238,22 @@ class main_manager:
         m = sink_manager(s,aliases=['zone%d' %(len(self.zones)+1)])
         m.start()
         self.zones.append(m)
+
+    def move_sink (self, sink_id, zone):
+        #
+        # first find the sink and remove from current zone
+        #
+        zone = self.get_zone(zone)
+        if not zone:
+            return 0
+        for i in self.zones:
+            sink = i.remove_sink(sink_id)
+            #
+            # If we found it, add to desired zone
+            #
+            if sink:
+                zone.add_sink(sink)
+                return 1
 
     def add_media (self, media, entrypoint='library'):
         if type(entrypoint) == list:
@@ -248,7 +284,7 @@ class main_manager:
         while True:
             request = self.queue.get()
             routed = False
-            print 'main_manager got item', request
+            # print 'main_manager got item', request
             # route to the appropriate component
             if request['_class'] == 'media':
                 if request['_ctx'] in self.media:
@@ -266,6 +302,15 @@ class main_manager:
             elif request['_class'] == 'main':
                 if request['_cmd'] == 'list':
                     request['_queue'].put(self.list_zones())
+            elif request['_class'] == 'sink':
+                if request['_cmd'] == 'move':
+                    if 'dst' not in request:
+                        request['_queue'].put({'_err':'dst required'})
+                        continue
+                    if self.move_sink(request['_ctx'],request['dst']):
+                        request['_queue'].put({'status':'okay'})
+                    else:
+                        request['_queue'].put({'_err':'failed to move %s to %s' %(request['_ctx'],request['dst'])})
             
 class api_handler (threading.Thread):
     def __init__ (self, mainq, conn):
@@ -334,7 +379,7 @@ class api_handler (threading.Thread):
     def run (self):
         while True:
             headers = self.conn.recv(2048)
-            print 'handler recieved request: %s' %headers
+            # print 'handler recieved request: %s' %headers
             if headers == '':
                 print 'closed connection'
                 self.status = 1
@@ -480,7 +525,10 @@ if __name__ == "__main__":
     m.add_media(mm)
 
     # for testing
-    m.create_sink('192.168.1.15',9988)
+    m.create_sink('192.168.1.15',9988,'livingroom')
+    m.create_sink('192.168.1.10',9988,'laptop')
+    # now move the sink
+    m.move_sink('192.168.1.10:9988','zone1')
 
     mm.start()
     a.start()

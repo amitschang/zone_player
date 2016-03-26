@@ -1,17 +1,30 @@
-import socket
-import threading
-import Queue
-import sys
-import os
 import json
-import uuid
-import sqlite3
+import logging
+import logging.handlers
+import os
+import Queue
 import signal
-import urllib
+import socket
+import sqlite3
+import sys
+import threading
 import time
+import urllib
+import uuid
+
+HB_SYNC_LIMIT = 100
 
 class sink:
-    '''class representing a network attached player using this protocol'''
+    #
+    # A class representing remote sink
+    #
+    # An address and port to connect are required, and optionally a
+    # list of alternative names to refer to this sink (e.g. location,
+    # common name, etc.).
+    #
+    # Once connected, this instance becomes the sole controller of the
+    # remote endpoint.
+    #
     def __init__ (self, address, port=9988, names=None):
         self.address = address
         self.port = port
@@ -32,8 +45,17 @@ class sink:
             'age':0,
         }
         self.last_conn_attempt = 0
+        self.default_timeout = 0.15
 
     def connect (self):
+        #
+        # Connect to remote sink. This function may be called during
+        # any command so throttle the connection attempts by time
+        # since last attempt
+        #
+        # Always do this in async manner, to check connection status
+        # send a command, e.g. query_state()
+        #
         if self.status['connected']:
             return
         if time.time() - self.last_conn_attempt < 1:
@@ -58,73 +80,116 @@ class sink:
             'aliases': self.aliases,
         }
 
-    def send_command (self, command, args=''):
-        if type(args) == list:
-            full_command = command+' '+' '.join(args)
+    def handle_socket_exception (self):
+        #
+        # Exception handler for remote sink socket. For timeout case,
+        # do nothing. For other cases, trigger a reconnect attempt
+        # (async)
+        #
+        e = sys.exc_info()
+        if e[0] == socket.timeout:
+            print 'got socket timeout on sink %s:%d' %(self.address,self.port)
         else:
-            full_command = command+' '+args
-            
+            self.status['connected'] = False
+            print 'socket error %s, attempting to reconnect'
+            print e
+            self.connect()
+
+    def send_command (self, op='-', track='-', time='-', vol='-'):
+        #
+        # Send command to remote sink. By default the command contains
+        # no data so the sink will respond with its current status.
+        #
+        cmd = [ op, track, str(time), str(vol) ]
+        try:
+            self.sock.send('\n'+' '.join(cmd))
+            self.status['connected'] = True
+            return 1
+        except:
+            self.handle_socket_exception()
+            return 0
+
+    def recv_state (self, timeout=None):
+        #
+        # Get some response from the remote sink. There may be several
+        # items lined up in the queue depending on timeouts and user
+        # commands so return the latest only
+        #
+        if not timeout:
+            timeout = self.default_timeout
+        try:
+            self.sock.settimeout(timeout)
+            resp = self.sock.recv(2048)
+            #
+            # If something closed the pipe, we may get null string
+            # back. Must try to reconnect in this case so trigger
+            # exception
+            #
+            if resp == '':
+                raise Exception
+            self.status['connected'] = True
+            resp = resp.split('\n')
+            if len(resp) < 2:
+                return 0
+            resp = resp[-2].split(' ')
+            if len(resp) == 4:
+                self.status['state']   = resp[0]
+                self.status['track']   = resp[1]
+                self.status['time']    = resp[2]
+                self.status['vol']     = resp[3]
+                self.status['contact'] = time.time()
+            else:
+                return 0
+        except:
+            self.handle_socket_exception()
+            return 0
+
+    def query_state (self):
+        #
+        # Query the state of remote endpoint. Do so synchronously, in
+        # the sense that we first query the remote sink and then wait
+        # for response before returning. Contrary to other send
+        # commands which do not wait for response.
+        #
+        # First clear the line
+        #
         try:
             self.sock.settimeout(0)
             self.sock.recv(2048)
         except:
             pass
+        self.send_command()
+        self.recv_state()
+        return self.get_state()
 
-        try:
-            self.sock.settimeout(0.2)
-            self.sock.send('\n'+full_command.strip())
-            self.status['connected'] = True
-            response = self.sock.recv(2048)
-            # print 'response: %s' %(response.strip())
-            response = response.split('\n')[-2].split(' ')
-            if response[0] == 'ok':
-                self.status['state'] = response[1]
-                self.status['track'] = response[2]
-                self.status['time'] = response[3]
-                self.status['vol'] = response[4]
-                self.status['contact'] = time.time()
-            else:
-                return 0
-        except:
-            e = sys.exc_info()
-            if e[0] == socket.timeout:
-                print 'got socket timeout on sink %s:%d' %(self.address,self.port)
-                return 0
-            else:
-                self.status['connected'] = False
-                print 'socket error %s, attempting to reconnect'
-                print e
-                self.connect()
-
-    def play (self):
-        return self.send_command('play')
-
-    def pause (self):
-        return self.send_command('pause')
-
-    def stop (self):
-        return self.send_command('stop')
-
-    def track (self,filename):
-        return self.send_command('track',filename)
-
-    def getstate (self):
-        self.send_command('getstate')
+    def get_state (self):
         self.status['age'] = time.time() - self.status['contact']
         return self.status
 
-    def time (self, stime=None):
-        if stime:
-            return self.send_command('settime', str(stime))
-        else:
-            return self.send_command('gettime')
+    def get_time (self):
+        self.query_state()
+        try:
+            return int(self.status['time'])
+        except:
+            return -1
 
-    def vol (self, volume=None):
-        if volume:
-            return self.send_command('vol', str(volume))
-        else:
-            return self.send_command('getvol')
+    def send_heartbeat (self, t):
+        self.send_command(op = 'hb', time  = t)
 
+    def pause (self):
+        return self.send_command(op = 'pause')
+
+    def stop (self):
+        return self.send_command(op = 'stop')
+
+    def track (self,filename):
+        return self.send_command(track = filename)
+
+    def seek (self, time):
+        return self.send_command(op = 'seek', time  = time)
+
+    def vol (self, volume):
+        return self.send_command(vol  = volume)
 
 class sink_manager (threading.Thread):
     def __init__ (self,sink=None,name=None,aliases=[]):
@@ -141,9 +206,14 @@ class sink_manager (threading.Thread):
         self.playlist = []
         self.lastadd = 0
         self.targetvol = 50
+        self.current_track = None
 
     def add_sink (self, sink):
         sink.connect()
+        print 'adding sink %s to zone %s' %(sink.id,self.name)
+        if self.is_playing():
+            t = self.heartbeat_time()
+            sink.send_command(track=self.current_track,time=t)
         self.sinks.append(sink)
 
     def remove_sink (self, sink_id):
@@ -162,11 +232,83 @@ class sink_manager (threading.Thread):
         }
 
     def playnext (self):
+        # print 'in playnext, len of playlist %d' %(len(self.playlist))
         if len(self.playlist) > 0:
             n = self.playlist.pop(0)
+            print 'got track to play %s' %n
             [ i.track(n) for i in self.sinks ]
+            self.current_track = n
             self.lastadd = time.time()
             print 'added track at time %d'%self.lastadd
+
+    def is_playing (self):
+        status = [ i.get_state()['state'] for i in self.sinks ]
+        if 'playing' in status:
+            return True
+        return False
+
+    def is_stopped (self):
+        status = [ i.get_state()['state'] for i in self.sinks ]
+        # print 'status array for zone %s:' %(self.aliases)
+        # print status
+        if 'playing' in status:
+            return False
+        if 'stopped' in status:
+            return True
+        return False
+
+    def heartbeat_time (self):
+        #
+        # This controller keeps track of the start time of track, and
+        # obtains the playtime of each player. Using all times
+        # together and rejecting any players very far off we can send
+        # a best estimate of what the time should be with two or more
+        # sinks.
+        #
+        sink_times = []
+        start_time = time.time()
+        for i in self.sinks:
+            _time = i.get_time()
+            if _time > 0:
+                sink_times.append(_time)
+
+        if len(sink_times) == 0:
+            return '0@%0.5f' %(time.time())
+
+        mean = (sum(sink_times))/(1.0*len(sink_times))
+        #
+        # Now reject any time significantly different from the mean
+        # time (not including our own)
+        #
+        final_times = []
+        for i in sink_times:
+            if abs(i-mean) < HB_SYNC_LIMIT:
+                final_times.append(i)
+        #
+        # Finally, the heartbeat time is the remaining mean. If there
+        # are none left, players are too far apart and we must choose
+        # the furthest along
+        #
+        if len(final_times) == 0:
+            t = max(sink_times)
+        else:
+            t = int(sum(final_times)/(1.0*len(final_times)))
+        end_time = time.time()
+        # Now we must adjust for time recv/calc time
+        c_delta = int((start_time-end_time)*1000)
+        t = '%d@%0.5f' %(t+c_delta,end_time)
+        return t
+
+    def heartbeat (self):
+        #
+        # A heartbeat is used to synchronize players. Calculate the
+        # appropriate hearbeat time and send to each player in our
+        # zone. The players themselves decide how to adjust their play
+        #
+        t = self.heartbeat_time()
+
+        for i in self.sinks:
+            i.send_heartbeat(t)
 
     def run (self):
         while True:
@@ -176,9 +318,15 @@ class sink_manager (threading.Thread):
                 cmd = None
                 pass
             if cmd:
+                if cmd == 'quit':
+                    print 'quitting zone managr'
+                    return
                 if len(self.sinks) == 0:
                     res={'_err':'zone has no sinks'}
                     cmd['_cmd'] = ''
+                if cmd['_cmd'] == 'seek':
+                    [ i.seek(cmd['time']) for i in self.sinks ]
+                    res={'okay':cmd['time']}
                 if cmd['_cmd'] == 'enqueue':
                     self.playlist.append(cmd['file'])
                     res={'file':cmd['file']}
@@ -208,7 +356,7 @@ class sink_manager (threading.Thread):
                 if cmd['_cmd'] == 'status':
                     res = {}
                     res['vol'] = self.targetvol
-                    res['sinks'] = [ i.getstate() for i in self.sinks ]
+                    res['sinks'] = [ i.get_state() for i in self.sinks ]
                     res['time'] = int(sum([ int(i['time']) for i in res['sinks'] ])/(1.0*len(res['sinks'])))
                     for i in res['sinks']:
                         i['skew'] = int(i['time'])-int(res['time'])
@@ -219,15 +367,15 @@ class sink_manager (threading.Thread):
 
             if len(self.sinks) > 0:
                 if max([ time.time() - i.status['contact'] for i in self.sinks ]) > 0.3:
-                    for i in self.sinks:
-                        i.getstate()
-        
-                if 'stopped' in [ i.status['state'] for i in self.sinks ]:
-                    if time.time() - self.lastadd > 1:
+                    self.heartbeat()
+                    # print 'time from last add: %d, stopped: %s' %(time.time() - self.lastadd,self.is_stopped())
+                    if self.is_stopped() and time.time() - self.lastadd > 1:
+                        # print 'playing next'
                         self.playnext()
 
-class main_manager:
+class main_manager (threading.Thread):
     def __init__ (self):
+        threading.Thread.__init__(self)        
         self.queue = Queue.Queue()
         self.sinks = []
         self.zones = []
@@ -280,11 +428,21 @@ class main_manager:
             elif name in z.aliases:
                 return z
             
+    def quit (self):
+        for i in self.zones:
+            print 'sending quit to zones'
+            i.queue.put('quit')
+        for i in self.media:
+            print 'sending quit to media'
+            self.media[i].queue.put('quit')
+
+    def run (self):
+        self.serve()
+            
     def serve (self):
         while True:
             request = self.queue.get()
             routed = False
-            # print 'main_manager got item', request
             # route to the appropriate component
             if request['_class'] == 'media':
                 if request['_ctx'] in self.media:
@@ -311,7 +469,17 @@ class main_manager:
                         request['_queue'].put({'status':'okay'})
                     else:
                         request['_queue'].put({'_err':'failed to move %s to %s' %(request['_ctx'],request['dst'])})
-            
+                if request['_cmd'] == 'add':
+                    try:
+                        if ':' in request['_ctx']:
+                            (addr,port) = request['_ctx'].split(':')
+                        else:
+                            (addr,port) = (request['_ctx'],9988)
+                        self.create_sink(addr,int(port))
+                        request['_queue'].put({'okay':'added sink %s:%s' %(addr,port)})
+                    except:
+                        request['_queue'].put({'_err':'could not add sink'})
+
 class api_handler (threading.Thread):
     def __init__ (self, mainq, conn):
         threading.Thread.__init__(self)
@@ -385,6 +553,9 @@ class api_handler (threading.Thread):
                 self.status = 1
                 if self.queue:
                     self.conn = self.queue.get()
+                    if self.conn == 'quit':
+                        print 'quitting api handler'
+                        return
                     self.status = 0
                     continue
                 else:
@@ -436,7 +607,12 @@ class api_server (threading.Thread):
                 self.threads[-1].start()
 
     def run (self):
-        self.serve()
+        try:
+            self.serve()
+        except:
+            for i in self.threads:
+                i.conn.close()
+                i.queue.put('quit')
 
 class media_manager (threading.Thread):
     def __init__ (self, dbfile):
@@ -493,6 +669,9 @@ class media_manager (threading.Thread):
         
         while True:
             req = self.queue.get()
+            if req == 'quit':
+                print 'quitting media manager'
+                return
             if req['_cmd'] == 'search':
                 if 'query' in req:
                     q = req['query']
@@ -503,11 +682,12 @@ class media_manager (threading.Thread):
                     req['_queue'].put(res)
                     if 'enqueue' in req and self.mgr_queue:
                         for i in res:
-                            add = { '_class': 'player',
-                                    '_ctx': req['enqueue'],
-                                    '_cmd': 'enqueue',
-                                    'file': i['filename'],
-                                }
+                            add = {
+                                '_class': 'player',
+                                '_ctx': req['enqueue'],
+                                '_cmd': 'enqueue',
+                                'file': i['filename'],
+                            }
                             self.mgr_queue.put(add)
                 except:
                     res = { '_error':
@@ -518,7 +698,21 @@ class media_manager (threading.Thread):
     def run (self):
         self.serve()
 
+def killself (signum, frame):
+    m.quit()
+    print 'sent all quits'
+    os.kill(os.getpid(), signal.SIGKILL)
+    sys.exit()
+
+logger = logging.getLogger('zp')
+logger.setLevel(logging.NOTSET)
+
 if __name__ == "__main__":
+    logger.addHandler(logging.StreamHandler())
+    logger.addHandler(logging.handlers.SysLogHandler())
+    logger.setLevel(logging.INFO)
+    logger.info('hello from logger')
+
     m = main_manager()
     a = api_server(9876,m.queue)
     mm = media_manager('/mnt/data/music/tracks.db')
@@ -526,10 +720,10 @@ if __name__ == "__main__":
 
     # for testing
     m.create_sink('192.168.1.15',9988,'livingroom')
-    m.create_sink('192.168.1.10',9988,'laptop')
-    # now move the sink
-    m.move_sink('192.168.1.10:9988','zone1')
+    # m.create_sink('192.168.1.10',9988,'laptop')
+
+    signal.signal(signal.SIGINT, killself)
 
     mm.start()
-    a.start()
-    m.serve()
+    m.start()
+    a.serve()
